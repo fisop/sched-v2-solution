@@ -404,30 +404,60 @@ sched_effective_priority(struct Env *e)
 }
 ```
 
-con `AGING_THRESHOLD == 8`: cada 8 decisiones de scheduling que un environment
+con `AGING_THRESHOLD == 4`: cada 4 decisiones de scheduling que un environment
 pasa esperando en la cola de listos, gana un punto de prioridad efectiva. El
 elegido resetea su `env_wait_ticks` a 0; todos los demás `ENV_RUNNABLE` lo
-incrementan.
+incrementan. La unidad es la *decisión de scheduling*, no el tick de timer: el
+contador se toca en `sched_yield`, que corre tanto en cada interrupción de timer
+como en cada `sys_yield`. Para dos procesos CPU-bound las dos magnitudes
+coinciden casi exactamente, porque ahí la única fuente de decisiones es el
+timer, y eso es lo que hace que los ticks de las estadísticas sirvan para
+verificar el peor caso.
 
-Por qué evita starvation: `env_wait_ticks` crece de forma monótona mientras el
-environment no sea elegido, así que su prioridad efectiva también. En el peor
-caso —un environment con `ENV_PRIORITY_MIN` compitiendo contra uno con
-`ENV_PRIORITY_MAX` que nunca se bloquea— alcanza al competidor después de
-`ENV_PRIORITY_MAX * AGING_THRESHOLD` = 120 decisiones de scheduling. Y cuando
-empatan, gana él: el recorrido de `sched_yield` arranca en `ENVX(curenv) + 1` y
-la comparación es estrictamente mayor (`prio > best_prio`), así que ante un
-empate se queda el primero encontrado, que es el que hace más tiempo que no
-corre. El que está corriendo nunca se desempata a su favor.
+**Peor caso de espera: 60 decisiones de scheduling.** `env_wait_ticks` crece de
+forma monótona mientras el environment no sea elegido, así que su prioridad
+efectiva también. En el peor escenario —un environment en `ENV_PRIORITY_MIN`
+compitiendo contra uno en `ENV_PRIORITY_MAX` que nunca se bloquea— necesita un
+bonus de 15 puntos para alcanzarlo, o sea
+`ENV_PRIORITY_MAX * AGING_THRESHOLD` = 15 · 4 = 60 decisiones.
+
+Y cuando empatan, gana el que estuvo esperando. Esto **no** sale del recorrido
+circular: el barrido arranca en `ENVX(curenv) + 1`, así que ordena los empates
+por índice de slot, no por antigüedad de la espera. Sale del desempate contra
+`curenv`, que es el que importa acá: el environment que está corriendo no
+aparece entre los candidatos del barrido (su `env_status` es `ENV_RUNNING`, no
+`ENV_RUNNABLE`), se lo considera aparte, y sólo conserva la CPU con prioridad
+efectiva **estrictamente** mayor. Con el `>=` en su lugar, el empate lo ganaría
+siempre el que ya está corriendo y la starvation volvería intacta a pesar del
+aging.
 
 La cota en `ENV_PRIORITY_MAX` no es necesaria para evitar starvation (un bonus
 sin techo también funciona), pero mantiene la prioridad efectiva en un rango
 conocido y hace que el peor caso de espera sea una constante calculable en lugar
 de depender de cuánto se dejó correr el sistema.
 
-La elección de 8 es un compromiso: con un umbral más chico el aging domina y la
-política se acerca a round robin (las prioridades dejan de significar mucho);
-con uno más grande las prioridades se respetan más estrictamente pero un proceso
-postergado tarda más en recibir CPU.
+Sobre la elección de 4: el umbral está apretado por los dos lados, y los dos
+límites son observables en los tests de esta parte.
+
+- Hacia arriba, el peor caso crece linealmente con el umbral. Con 8 —el primer
+  valor que se probó— son 120 decisiones, más de lo que produce una corrida
+  corta: `user/agingtest.c` terminaba entero en ~99 ticks, de los cuales apenas
+  la mitad ocurrían con el proceso de prioridad alta todavía vivo. El bonus del
+  postergado llegaba a ~6 sobre los 15 que necesitaba y no corría nunca. La
+  garantía anti-starvation seguía siendo cierta, pero era inobservable, que para
+  un mecanismo cuyo único propósito es ese equivale a no tenerlo.
+- Hacia abajo, el umbral es lo que un punto de prioridad "vale" en decisiones de
+  scheduling. Con 1 o 2, los cuatro hijos de `user/priotest.c` —que están
+  separados por un punto— se reordenan tan rápido que la prioridad base deja de
+  ser visible en la salida. No es que la política se vuelva round robin (para
+  prioridades *iguales* la alternancia es de a una decisión con cualquier
+  umbral), pero sí se achica la ventaja de cada nivel: un proceso postergado por
+  una diferencia de `g` puntos recibe la CPU una vez cada `g * AGING_THRESHOLD`
+  decisiones, así que el umbral es directamente el factor de esa proporción.
+
+Con 4, el peor caso queda en 60 decisiones —alcanzable con holgura por un test
+CPU-bound razonable— y una diferencia de un solo punto de prioridad todavía se
+traduce en 4 turnos consecutivos, que se ven en la salida de `priotest`.
 
 ### Reglas de seguridad de las syscalls
 
@@ -472,31 +502,83 @@ en `ENV_PRIORITY_MIN`— que nunca llaman a `sys_yield`: la única forma de que
 alternen es la preemption. El padre se saca del medio durmiendo con `sys_sleep`
 en lugar de cediendo la CPU, para no competir en la cola de listos.
 
-`[CAPTURA]` salida de `make qemu USE_PR=1` con
+El dimensionamiento del test es la parte delicada, y la constante que lo gobierna
+es `NROUNDS`, no `BUSY_ITERATIONS`. Llamando `K = ENV_PRIORITY_MAX *
+AGING_THRESHOLD` = 15 · 4 = 60 al peor caso de espera, y aprovechando que
+ninguno de los dos workers hace syscalls —con lo cual toda decisión viene de un
+tick de timer y cada turno dura exactamente un tick—, la relación de CPU entre
+los dos es de `K` a 1. De ahí salen dos condiciones:
+
+1. "alta" tiene que seguir viva más de `K` decisiones, o "baja" no recibe ni un
+   turno. Su vida es `NROUNDS · r` decisiones, con `r` = ticks que tarda una
+   ronda.
+2. "baja" sólo acumula `1/K` de la CPU, así que antes de que "alta" termine
+   completa `(NROUNDS · r) / K / r` = `NROUNDS / K` rondas, y por lo tanto
+   imprime esa cantidad de líneas. **La `r` se cancela**: agrandar
+   `BUSY_ITERATIONS` alarga las rondas de los dos procesos por el mismo factor y
+   no mueve ese número en absoluto.
+
+La segunda condición es la que la primera versión del test no cumplía, y es un
+error instructivo: con `NROUNDS = 20` y `K = 120` (el umbral era 8), "baja"
+completaba 1/6 de ronda y no imprimía nada, y ninguna cantidad de trabajo extra
+por ronda podía haberlo arreglado. Bajar el umbral a 4 sólo llevó la fracción a
+1/3: seguía siendo menos de una ronda. Lo que lo resuelve es `NROUNDS = 200`, que
+con `K = 60` da ~3 líneas de "baja" antes de que "alta" termine; y con
+`BUSY_ITERATIONS = 3_000_000` una ronda tarda ~0,74 ticks, lo que deja la vida de
+"alta" en ~148 decisiones contra las 60 necesarias, cubriendo la condición 1 con
+holgura.
+
+`[CAPTURA]` salida de `make qemu-nox USE_PR=1` con
 `ENV_CREATE(user_agingtest, ENV_TYPE_USER)`. Lo que hay que ver: líneas del
-worker "baja" intercaladas *antes* de que el worker "alta" termine sus 20
-rondas. Para ver el contraste, subir `AGING_THRESHOLD` a un valor enorme (o
-devolver directamente `e->env_priority` en `sched_effective_priority`) y
-comprobar que en ese caso "baja" no imprime nada hasta que "alta" termina: eso
-es starvation.
+worker "baja" intercaladas *antes* de que el worker "alta" termine sus 200
+rondas (unas 3, por la cuenta de arriba), y en las estadísticas finales un
+"bonus maximo de aging" de 15 para "baja" —la prueba de que su bonus saturó y por
+eso pudo ganar— contra 0 para "alta", que nunca tuvo que esperar. Para el contraste, comentar el `+ bonus` en
+`sched_effective_priority` y volver a correr: ahí "baja" no imprime nada hasta
+que "alta" termina, y su bonus máximo queda en 0. Eso es la starvation.
 
-Si el host es mucho más rápido o más lento de lo previsto puede hacer falta
-ajustar `BUSY_ITERATIONS`: el criterio es que "alta" se mantenga CPU-bound
-bastante más de 120 ticks, que es lo que necesita "baja" para saturar su bonus.
+Vale la pena notar por qué el bonus máximo tuvo que agregarse a las
+estadísticas: `env_priority` es la prioridad *base* y el aging no la modifica
+nunca —el bonus vive en la efectiva, que se recalcula en cada decisión y se
+descarta—, así que unas estadísticas que sólo muestren `env_priority` se ven
+exactamente iguales en una corrida donde el aging fue decisivo y en una donde no
+actuó jamás. Por eso `sched_run` recibe la prioridad efectiva desde el llamador
+(el policy ya reseteó el contador de espera cuando llega ahí) y la registra
+tanto en el historial como en el máximo por environment.
 
-`[CAPTURA]` salida de `user/priotest.c`, que además verifica las dos reglas de
-seguridad: el intento de subir la propia prioridad tiene que fallar con
-`-E_INVAL` y el de bajarla tiene que devolver 0.
+`user/priotest.c` cubre el otro lado, el de que la política favorece a los
+procesos de alta prioridad. El detalle de diseño que lo hace funcionar es que
+los cuatro hijos reciben prioridades *por debajo* de la del padre: `fork` deja
+al hijo `ENV_RUNNABLE` con la prioridad heredada y el padre le asigna la real
+recién cuando `fork` ya retornó, así que con los hijos por encima el primero lo
+preemptaría y correría hasta terminar antes de que el padre alcanzara a crear al
+siguiente —nunca habría dos hijos compitiendo a la vez y el test no compararía
+nada—. Quedando por encima de todos, el padre crea el conjunto completo y
+después los larga a todos juntos bajando su propia prioridad por debajo de la de
+ellos, que es justamente la operación que las reglas de seguridad permiten. Los
+hijos, por su parte, esperan a que su prioridad cambie antes de arrancar, para no
+llegar a correr con la heredada en la ventana entre `fork` y `sys_setpriority`.
+
+`[CAPTURA]` salida de `user/priotest.c` con `USE_PR=1`. Lo que hay que ver: los
+cuatro hijos terminando en orden descendente de prioridad, con alguna línea
+suelta de los de prioridad más baja intercalada en el medio (ése es el aging
+actuando sobre diferencias de un punto, cada 4 decisiones). Además verifica las
+dos reglas de seguridad: el intento de subir la propia prioridad falla con
+`-E_INVAL` y el de bajarla devuelve 0.
 
 ### Comparación de estadísticas entre `USE_RR=1` y `USE_PR=1`
 
-`[CAPTURA]` correr el mismo conjunto de procesos en los dos modos y pegar las
-dos salidas de estadísticas.
+`[CAPTURA]` correr `user/priotest.c` en los dos modos —sin tocar nada más que
+el flag— y pegar las dos salidas de estadísticas.
 
-Lo que se espera: en round robin, los ticks de CPU reparten de forma
-aproximadamente uniforme entre los procesos listos, y la distribución por
-prioridad muestra todo concentrado en un único nivel (todos tienen la prioridad
-por defecto). Con prioridades, los ticks se concentran en los niveles altos, y
+Lo que se espera: en round robin los cuatro hijos avanzan a la par y sus líneas
+salen intercaladas de forma pareja, aunque tengan prioridades distintas —la
+política simplemente no las mira, y los ticks se reparten de forma
+aproximadamente uniforme entre los procesos listos—. La distribución por
+prioridad se sigue llenando (las syscalls de prioridad existen con las dos
+políticas y el test las usa igual), pero muestra un reparto plano entre niveles
+en lugar de una concentración. Con prioridades, en cambio, los hijos terminan en
+orden descendente de prioridad, los ticks se concentran en los niveles altos, y
 la fracción que reciben los niveles bajos es exactamente lo que aporta el aging:
 sin él sería cero.
 

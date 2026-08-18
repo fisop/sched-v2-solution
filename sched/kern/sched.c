@@ -8,12 +8,32 @@
 
 void sched_halt(void);
 
-// Every AGING_THRESHOLD ticks of waiting, an environment gains one point of
-// effective priority. See sched_effective_priority().
-#define AGING_THRESHOLD 8
+// Every AGING_THRESHOLD scheduling decisions spent waiting, an environment
+// gains one point of effective priority. See sched_effective_priority().
+//
+// The value is squeezed from both sides. Upwards, because the worst case wait
+// is ENV_PRIORITY_MAX * AGING_THRESHOLD decisions (what an environment at the
+// minimum priority needs to catch up with one at the maximum): with 8 that's
+// 120 decisions, more than a short run produces, and the anti-starvation
+// guarantee becomes unobservable. Downwards, because user/priotest.c compares
+// children one priority point apart, and a threshold of 1 or 2 lets aging
+// reorder them so fast that the priority itself stops being visible. 4 leaves
+// the worst case at 60 decisions and still needs 4 consecutive decisions to
+// overcome a single point of priority.
+#define AGING_THRESHOLD 4
 
 // Number of scheduling decisions remembered in the history.
 #define SCHED_HISTORY_LEN 16
+
+#ifdef SCHED_PRIORITIES
+static uint32_t sched_effective_priority(struct Env *e);
+
+// Effective priority of an environment under the active policy. Round robin
+// ignores priorities altogether, so there the effective one is just the base.
+#define EFFECTIVE_PRIORITY(e) sched_effective_priority(e)
+#else
+#define EFFECTIVE_PRIORITY(e) ((e)->env_priority)
+#endif
 
 
 /****************************************************************
@@ -30,14 +50,16 @@ struct EnvStat {
 	uint32_t runs;      // times the scheduler picked it
 	uint32_t cputicks;  // CPU ticks it accumulated
 	uint32_t priority;  // last priority it ran with
+	uint32_t maxbonus;  // largest aging bonus it ever got picked with
 };
 static struct EnvStat sched_env_stats[NENV];
 
 // Circular history of the most recent scheduling decisions.
 struct SchedHistory {
 	envid_t env_id;
-	uint32_t tick;      // tick at which it started running
-	uint32_t priority;  // priority it was picked with
+	uint32_t tick;       // tick at which it started running
+	uint32_t priority;   // base priority it was picked with
+	uint32_t effective;  // effective priority (base + aging bonus)
 };
 static struct SchedHistory sched_history[SCHED_HISTORY_LEN];
 static uint32_t sched_history_count;
@@ -75,13 +97,19 @@ sched_account_cputicks(void)
 
 // Records the scheduling decision and runs the chosen environment.
 // Does not return.
-static void sched_run(struct Env *e) __attribute__((noreturn));
+//
+// 'effective' is the effective priority the environment was picked with. It
+// has to come from the caller because the priority policy resets the winner's
+// wait counter before running it, so by this point the bonus can no longer be
+// recomputed.
+static void sched_run(struct Env *e, uint32_t effective) __attribute__((noreturn));
 
 static void
-sched_run(struct Env *e)
+sched_run(struct Env *e, uint32_t effective)
 {
 	struct EnvStat *st = &sched_env_stats[ENVX(e->env_id)];
 	struct SchedHistory *h;
+	uint32_t bonus = effective - e->env_priority;
 
 	sched_account_cputicks();
 
@@ -100,14 +128,18 @@ sched_run(struct Env *e)
 		st->env_id = e->env_id;
 		st->runs = 0;
 		st->cputicks = 0;
+		st->maxbonus = 0;
 	}
 	st->runs++;
 	st->priority = e->env_priority;
+	if (bonus > st->maxbonus)
+		st->maxbonus = bonus;
 
 	h = &sched_history[sched_history_count % SCHED_HISTORY_LEN];
 	h->env_id = e->env_id;
 	h->tick = ticks;
 	h->priority = e->env_priority;
+	h->effective = effective;
 	sched_history_count++;
 
 	sched_running_id = e->env_id;
@@ -129,9 +161,10 @@ sched_print_stats(void)
 	cprintf("politica: round robin preemptivo\n");
 #endif
 #ifdef SCHED_PRIORITIES
-	cprintf("politica: prioridades con aging (umbral: %d ticks de espera "
-	        "por punto)\n",
-	        AGING_THRESHOLD);
+	cprintf("politica: prioridades con aging (umbral: %d decisiones de "
+	        "espera por punto, peor caso %d)\n",
+	        AGING_THRESHOLD,
+	        ENV_PRIORITY_MAX * AGING_THRESHOLD);
 #endif
 	cprintf("llamadas al scheduler (sched_yield): %d\n", sched_calls);
 	cprintf("ticks de timer desde el arranque: %d\n", ticks);
@@ -141,11 +174,20 @@ sched_print_stats(void)
 		if (sched_env_stats[i].env_id == 0)
 			continue;
 		cprintf("  [%08x] elegido %d veces, %d ticks de CPU, prioridad "
-		        "%d\n",
+		        "%d",
 		        sched_env_stats[i].env_id,
 		        sched_env_stats[i].runs,
 		        sched_env_stats[i].cputicks,
 		        sched_env_stats[i].priority);
+#ifdef SCHED_PRIORITIES
+		// The base priority never changes with aging: the bonus lives
+		// in the effective priority, which is recomputed on every
+		// decision. Without printing it, a run where aging was decisive
+		// looks identical to one where it never fired.
+		cprintf(" (bonus maximo de aging: %d)",
+		        sched_env_stats[i].maxbonus);
+#endif
+		cprintf("\n");
 	}
 
 	n = sched_history_count < SCHED_HISTORY_LEN ? sched_history_count
@@ -157,10 +199,19 @@ sched_print_stats(void)
 	for (i = 0; i < n; i++) {
 		struct SchedHistory *h =
 		        &sched_history[(sched_history_count - 1 - i) % SCHED_HISTORY_LEN];
+#ifdef SCHED_PRIORITIES
+		cprintf("  [%08x] desde el tick %d (prioridad %d, efectiva "
+		        "%d)\n",
+		        h->env_id,
+		        h->tick,
+		        h->priority,
+		        h->effective);
+#else
 		cprintf("  [%08x] desde el tick %d (prioridad %d)\n",
 		        h->env_id,
 		        h->tick,
 		        h->priority);
+#endif
 	}
 
 	total = 0;
@@ -219,11 +270,11 @@ sched_wakeup_sleeping(void)
 // long the environment has been waiting in the ready queue.
 //
 // The bonus saturates at ENV_PRIORITY_MAX, which is enough for any postponed
-// environment to catch up to the system's maximum priority: on a tie, the
-// circular scan in sched_yield() (which starts right after the current
-// environment) gives the turn to whichever one isn't currently running.
-// Saturating it keeps the effective priority bounded and makes the worst-case
-// wait predictable: ENV_PRIORITY_MAX * AGING_THRESHOLD scheduling decisions.
+// environment to catch up to the system's maximum priority: once it ties, it
+// wins, because the environment that is currently running only keeps the CPU
+// with a strictly higher effective priority (see sched_yield). Saturating it
+// keeps the effective priority bounded and makes the worst-case wait
+// predictable: ENV_PRIORITY_MAX * AGING_THRESHOLD scheduling decisions.
 static uint32_t
 sched_effective_priority(struct Env *e)
 {
@@ -256,7 +307,7 @@ sched_yield(void)
 		struct Env *e = &envs[(start + i) % NENV];
 
 		if (e->env_status == ENV_RUNNABLE)
-			sched_run(e);
+			sched_run(e, e->env_priority);
 	}
 #endif
 
@@ -264,10 +315,13 @@ sched_yield(void)
 	struct Env *best = NULL;
 	uint32_t best_prio = 0;
 
-	// Highest effective priority among the ENV_RUNNABLE ones. On a tie
-	// the first one in the circular scan wins, i.e. whoever hasn't run
-	// the longest: that's what turns aging into an anti-starvation
-	// mechanism.
+	// Highest effective priority among the ENV_RUNNABLE ones. On a tie the
+	// first one in the circular scan wins. Note that this orders ties by
+	// slot index (starting right after the current environment), not by
+	// how long each one has been waiting: with several environments tied
+	// at the same effective priority, the scan does not favor the oldest.
+	// What makes aging an anti-starvation mechanism is not this tie-break
+	// but the one against curenv, further down.
 	for (i = 0; i < NENV; i++) {
 		struct Env *e = &envs[(start + i) % NENV];
 		uint32_t prio;
@@ -318,7 +372,7 @@ sched_yield(void)
 		}
 		best->env_wait_ticks = 0;
 
-		sched_run(best);
+		sched_run(best, best_prio);
 	}
 #endif
 
@@ -326,7 +380,7 @@ sched_yield(void)
 	// ENV_RUNNING (for example, it was preempted by the timer and is the
 	// only process alive), it can be picked again.
 	if (curenv && curenv->env_status == ENV_RUNNING)
-		sched_run(curenv);
+		sched_run(curenv, EFFECTIVE_PRIORITY(curenv));
 
 	// sched_halt never returns
 	sched_halt();

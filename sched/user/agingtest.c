@@ -6,28 +6,45 @@
 //
 // With a pure priority scheduler, the min-priority process would never be
 // picked while the max-priority one stays ready: that's starvation. With
-// aging, its effective priority grows while it waits until it catches up to
-// the other one, and per the scheduler's design (sched_effective_priority)
-// ties are resolved in favor of whoever has gone the longest without
-// running. So the expectation is to see "low" lines interleaved before
+// aging, its effective priority grows while it waits until it ties with the
+// other one, and a tie goes to whoever is not currently running (see
+// sched_yield). So the expectation is to see "low" lines interleaved before
 // "high" finishes.
 //
-// The constants are chosen so that the high-priority process stays CPU-bound
-// well past ENV_PRIORITY_MAX * AGING_THRESHOLD = 120 ticks (the number the
-// other one needs to saturate its aging bonus and only then be able to beat
-// it: below saturation, its effective priority stays strictly lower than
-// "high"'s, so it can't win even once). Measured on a real run, NROUNDS=20
-// with BUSY_ITERATIONS=10_000_000 only produced ~47 ticks total — far below
-// the threshold, so "low" never got to run while "high" was still alive. If
-// "low" still doesn't show up until "high" finishes completely with the
-// current value, raise BUSY_ITERATIONS (or lower AGING_THRESHOLD in
-// kern/sched.c) until "timer ticks since boot" in the final statistics comes
-// out well above 120 for the whole run.
+// Sizing the test is the delicate part, and the constant that governs it is
+// NROUNDS, not BUSY_ITERATIONS. Let K = ENV_PRIORITY_MAX * AGING_THRESHOLD =
+// 15 * 4 = 60, the worst-case wait of the aging function: the number of
+// decisions "low" needs to saturate its bonus and only then be able to tie
+// with "high" (below saturation its effective priority stays strictly lower,
+// so it cannot win even once). Neither worker ever makes a syscall, so every
+// scheduling decision comes from a timer tick and each turn lasts exactly one
+// tick. That gives a CPU ratio of K to 1, and two conditions:
+//
+//   1. "high" has to stay alive for more than K decisions, or "low" never gets
+//      a single turn. Its lifetime is NROUNDS * r decisions, where r is the
+//      ticks one round takes.
+//   2. "low" only accumulates 1/K of the CPU, so before "high" finishes it
+//      completes (NROUNDS * r) / K / r = NROUNDS / K rounds — and therefore
+//      prints that many lines. The r cancels out: raising BUSY_ITERATIONS
+//      lengthens the rounds of both processes by the same factor and does not
+//      move this number at all. NROUNDS has to exceed K, period.
+//
+// That second condition is what the first version of this test got wrong: with
+// NROUNDS=20 and K=120 (the threshold used to be 8), "low" completed 1/6 of a
+// round and printed nothing, and no amount of extra work per round could have
+// fixed it. With NROUNDS=200 and K=60 it prints ~3 lines before "high" is done,
+// and condition 1 holds with margin: measured at 10_000_000 iterations a round
+// takes ~2.5 ticks, so at 3_000_000 it takes ~0.74, putting "high"'s lifetime
+// at ~148 decisions against the 60 needed.
+//
+// To check both conditions on another host, look at the final statistics: the
+// total ticks should be a few times 60, and "low" should report a maximum aging
+// bonus of 15 (its bonus saturated, which is the only way it could have won).
 
 #include <inc/lib.h>
 
-#define NROUNDS 20
-#define BUSY_ITERATIONS 100000000
+#define NROUNDS 200
+#define BUSY_ITERATIONS 3000000
 
 // An environment is still alive as long as its slot in envs[] (mapped
 // read-only at UENVS) is still its own and hasn't gone back to the free list.

@@ -137,25 +137,6 @@ del proceso más un bonus que crece con el tiempo que lleva esperando su turno:
 prioridad_efectiva = env_priority + aging_bonus(espera acumulada)
 ```
 
-Quedan a criterio del alumno, y hay que justificarlos en el informe:
-
-- La función `aging_bonus`, que tiene que ser creciente (una división entera por
-  una constante es suficiente, pero no es la única opción).
-- El valor de esa constante, si la función usa alguna. No hay ninguna definida
-  en el esqueleto: es una decisión de diseño, no un dato del enunciado.
-- En qué unidad se acumula la espera de `env_wait_ticks` y en qué momento se
-  actualiza. Notar que un proceso deja de estar en la cola de listos cuando es
-  elegido, así que su espera acumulada tiene que volver a cero en algún punto:
-  si no, el bonus crece para siempre y las prioridades base dejan de significar
-  algo.
-
-Atención a quién entra en la selección: el proceso que está corriendo no está en
-`ENV_RUNNABLE`, porque `env_run` lo dejó en `ENV_RUNNING`, así que un barrido que
-sólo mire los `ENV_RUNNABLE` no lo va a considerar candidato. ¿Qué pasa entonces
-con dos procesos CPU-bound de prioridades distintas, si el único candidato que el
-barrido puede encontrar es siempre "el otro"? ¿Y qué conviene hacer cuando el que
-está corriendo empata en prioridad efectiva con uno que está esperando?
-
 ### Syscalls de prioridad
 
 Implementar:

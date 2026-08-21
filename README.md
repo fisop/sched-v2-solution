@@ -137,25 +137,6 @@ del proceso más un bonus que crece con el tiempo que lleva esperando su turno:
 prioridad_efectiva = env_priority + aging_bonus(espera acumulada)
 ```
 
-Quedan a criterio del alumno, y hay que justificarlos en el informe:
-
-- La función `aging_bonus`, que tiene que ser creciente (una división entera por
-  una constante es suficiente, pero no es la única opción).
-- El valor de esa constante, si la función usa alguna. No hay ninguna definida
-  en el esqueleto: es una decisión de diseño, no un dato del enunciado.
-- En qué unidad se acumula la espera de `env_wait_ticks` y en qué momento se
-  actualiza. Notar que un proceso deja de estar en la cola de listos cuando es
-  elegido, así que su espera acumulada tiene que volver a cero en algún punto:
-  si no, el bonus crece para siempre y las prioridades base dejan de significar
-  algo.
-
-Atención a quién entra en la selección: el proceso que está corriendo no está en
-`ENV_RUNNABLE`, porque `env_run` lo dejó en `ENV_RUNNING`, así que un barrido que
-sólo mire los `ENV_RUNNABLE` no lo va a considerar candidato. ¿Qué pasa entonces
-con dos procesos CPU-bound de prioridades distintas, si el único candidato que el
-barrido puede encontrar es siempre "el otro"? ¿Y qué conviene hacer cuando el que
-está corriendo empata en prioridad efectiva con uno que está esperando?
-
 ### Syscalls de prioridad
 
 Implementar:
@@ -198,40 +179,30 @@ respaldar la demostración que pide la Tarea.
 - Modificar `env_alloc` en `kern/env.c` para asignar prioridad por defecto.
 - Modificar el manejo de `fork` para heredar prioridad.
 - Ejecutar `user/priotest.c` (vía `ENV_CREATE(user_priotest, ENV_TYPE_USER)` en
-  `kern/init.c`) y mostrar que el scheduler favorece a los procesos de alta
-  prioridad. El test crea cuatro hijos con una prioridad distinta cada uno, por
-  debajo de la del padre, y los larga a todos juntos recién cuando el padre baja
-  la suya. Lo que corresponde observar es que **terminan en orden descendente de
-  prioridad**, no que sus líneas salgan intercaladas de forma pareja: con una
-  política de prioridades el proceso de mayor prioridad acapara la CPU hasta que
-  termina. Sí es esperable que aparezcan algunas líneas sueltas de los de menor
-  prioridad en el medio — ése es el aging, y conviene señalarlo. Correr el mismo
-  test con `USE_RR=1` da el contraste: ahí los cuatro avanzan a la par.
-- Demostrar con un test propio que el aging evita starvation. El escenario
-  mínimo son dos procesos CPU-bound que **nunca** cedan la CPU por su cuenta
-  (sin `sys_yield`, sin `sys_sleep`, sin `cprintf` de más), uno en la prioridad
-  máxima y otro en la mínima, de modo que lo único que pueda sacarles la CPU sea
-  la preemption del timer. Hay que mostrar que el de prioridad mínima obtiene
-  CPU *antes* de que el de prioridad máxima termine.
-  - Atención al tamaño del test, porque es donde es fácil concluir que la
-    implementación está mal cuando lo que está mal es el test. Llamando `K` al
-    peor caso de espera de la función de aging, el proceso postergado recibe la
-    CPU una vez cada `K` decisiones, así que hay dos condiciones a cumplir. Una:
-    el proceso de prioridad máxima tiene que seguir vivo más de `K` decisiones,
-    o el otro no llega a recibir ni un turno. Dos: el postergado sólo acumula
-    `1/K` de la CPU, así que su trabajo tiene que estar dividido en suficientes
-    pasos observables como para completar al menos uno —idealmente varios— con
-    esa fracción. Ojo con la trampa de la segunda: agrandar el trabajo de cada
-    paso alarga por igual los dos procesos y no cambia en nada cuántos pasos
-    alcanza a completar el postergado; lo que hay que aumentar es la cantidad de
-    pasos. Conviene verificar las dos condiciones contra los ticks de timer que
-    reportan las propias estadísticas.
-  - Para tener con qué comparar, correr el mismo test anulando el bonus de aging
-    (devolviendo la prioridad base tal cual): ahí sí el de prioridad mínima no
-    debería imprimir nada hasta que el otro haya terminado. Ésa es la starvation
-    contra la que se contrasta.
-  - Los programas de usuario nuevos van en `user/` y hay que agregarlos a
-    `KERN_BINFILES` en `kern/Makefrag`.
+  `kern/init.c`).
+
+Al terminar esta parte, con `USE_PR=1`:
+
+- El scheduler elige por prioridad efectiva, existen `sys_getpriority` y
+  `sys_setpriority` con las reglas de seguridad de arriba, todo proceso arranca
+  con una prioridad por defecto y el hijo de un `fork` hereda la del padre.
+- Las estadísticas incluyen el historial de decisiones y la distribución de CPU
+  por prioridad.
+- `user/priotest.c` corre y muestra que la política favorece a los procesos de
+  alta prioridad (dejar un único `ENV_CREATE(user_priotest, ENV_TYPE_USER)`; el
+  binario ya está declarado). Cuidado con la expectativa: con prioridades el
+  proceso de mayor prioridad acapara la CPU hasta terminar, así que lo que
+  corresponde ver es a los hijos terminando en orden descendente de prioridad, y
+  no cuatro series de líneas intercaladas de forma pareja. Correr el mismo test
+  con `USE_RR=1` da el contraste.
+- Un test propio demuestra que el aging evita starvation. El escenario son dos
+  procesos CPU-bound con prioridades distintas que nunca cedan la CPU por su
+  cuenta —así lo único que puede sacársela es la preemption del timer— y hay que
+  mostrar que el postergado obtiene CPU *antes* de que el otro termine. Los
+  programas de usuario nuevos van en `user/` y hay que agregarlos a
+  `KERN_BINFILES` en `kern/Makefrag`.
+- El mismo test, anulando el bonus de aging, muestra la starvation contra la que
+  se compara.
 
 ### Informe
 

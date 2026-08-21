@@ -188,21 +188,9 @@ Al terminar esta parte, con `USE_PR=1`:
   con una prioridad por defecto y el hijo de un `fork` hereda la del padre.
 - Las estadísticas incluyen el historial de decisiones y la distribución de CPU
   por prioridad.
-- `user/priotest.c` corre y muestra que la política favorece a los procesos de
-  alta prioridad (dejar un único `ENV_CREATE(user_priotest, ENV_TYPE_USER)`; el
-  binario ya está declarado). Cuidado con la expectativa: con prioridades el
-  proceso de mayor prioridad acapara la CPU hasta terminar, así que lo que
-  corresponde ver es a los hijos terminando en orden descendente de prioridad, y
-  no cuatro series de líneas intercaladas de forma pareja. Correr el mismo test
-  con `USE_RR=1` da el contraste.
-- Un test propio demuestra que el aging evita starvation. El escenario son dos
-  procesos CPU-bound con prioridades distintas que nunca cedan la CPU por su
-  cuenta —así lo único que puede sacársela es la preemption del timer— y hay que
-  mostrar que el postergado obtiene CPU *antes* de que el otro termine. Los
-  programas de usuario nuevos van en `user/` y hay que agregarlos a
-  `KERN_BINFILES` en `kern/Makefrag`.
-- El mismo test, anulando el bonus de aging, muestra la starvation contra la que
-  se compara.
+- Ejecutar `user/priotest.c` (dejar un único `ENV_CREATE(user_priotest, ENV_TYPE_USER);` el binario ya está declarado). Con prioridades, el proceso de mayor prioridad acapara la CPU hasta terminar, por lo que se espera que los hijos terminen en orden descendente de prioridad y no que sus líneas aparezcan intercaladas de forma pareja. Ejecutar el mismo test con `USE_RR=1` para contrastar el comportamiento.
+- Escribir un test propio demuestra que el aging evita starvation. El escenario debe consistir en dos procesos CPU-bound con prioridades distintas que nunca cedan la CPU por su cuenta, de modo que la única forma de quitarle la CPU al proceso que está ejecutando sea mediante la preemption del timer. El proceso de mayor prioridad debe mantenerse ejecutando durante suficiente tiempo como para que el de menor prioridad pueda acumular el bonus de aging. Con aging habilitado, se debe observar que el proceso de menor prioridad obtiene CPU antes de que termine el proceso de mayor prioridad, demostrando que no queda en starvation. Los programas de usuario nuevos van en `user/` y hay que agregarlos a `KERN_BINFILES` en `kern/Makefrag`.
+- El mismo test debe ejecutarse nuevamente anulando el bonus de aging. En este caso, el proceso de menor prioridad debe permanecer sin obtener CPU mientras el de mayor prioridad continúe ejecutando, y recién podrá ejecutarse cuando este termine. Esta ejecución sirve como contraste y debe mostrar la starvation que el aging busca evitar.
 
 ### Informe
 
